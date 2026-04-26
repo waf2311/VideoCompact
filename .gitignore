@@ -1,2 +1,3 @@
-*.exe
+ffmpeg.exe
+ffprobe.exe
 *.mp4
