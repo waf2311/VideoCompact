@@ -1,5 +1,7 @@
 # VideoCompact
 
+![Example](./example.png)
+
 用于批量处理小米摄像机导出的 `H.265 / HEVC 4K mp4` 录像。
 
 脚本会扫描 `input` 目录中的所有 `mp4` 文件，识别其中连续静止超过 3 秒的片段，并按规则压缩时间轴后输出到 `output` 目录。
