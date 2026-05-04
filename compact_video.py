@@ -4,13 +4,20 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 
 # ================= 配置区 =================
-FFMPEG_PATH = r"D:\VideoCompact\ffmpeg.exe"
-FFPROBE_PATH = r"D:\VideoCompact\ffprobe.exe"
-INPUT_DIR = r"D:\VideoCompact\input"
-OUTPUT_DIR = r"D:\VideoCompact\output"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+FFMPEG_PATH = os.path.join(BASE_DIR, "ffmpeg.exe")
+FFPROBE_PATH = os.path.join(BASE_DIR, "ffprobe.exe")
+INPUT_DIR = os.path.join(BASE_DIR, "input")
+OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+LOG_DIR = os.path.join(BASE_DIR, "logs")
 
 # 沿用原脚本的 mpdecimate 判静止思路。
 DECIMATE_PARAMS = "hi=5000:lo=3000:frac=0.02"
@@ -47,8 +54,31 @@ ENCODE_PRESET = "p5"
 # 固定使用 CQ 20；若输出仍比原文件大，则直接复制原文件到 output。
 FIXED_CQ = 20
 
+# 并发处理数量（按视频）。
+MAX_WORKERS = 3
+
+# 编码并发槽位（NVENC 限流，建议 1-2）。
+MAX_ENCODE_JOBS = 1
+
 SHOWINFO_RE = re.compile(r"pts_time:(\d+(?:\.\d+)?)")
 # ========================================
+
+
+ENCODE_SEMAPHORE = threading.Semaphore(MAX_ENCODE_JOBS)
+
+
+class TeeWriter:
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, data):
+        for stream in self.streams:
+            stream.write(data)
+        return len(data)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
 
 
 def run_command(cmd, check=True):
@@ -65,6 +95,28 @@ def run_command(cmd, check=True):
 
 def ensure_output_dir():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+def ensure_log_dir():
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+
+def validate_environment():
+    if not os.path.isfile(FFMPEG_PATH):
+        raise FileNotFoundError(f"未找到 ffmpeg: {FFMPEG_PATH}")
+    if not os.path.isfile(FFPROBE_PATH):
+        raise FileNotFoundError(f"未找到 ffprobe: {FFPROBE_PATH}")
+
+    if not os.path.isdir(INPUT_DIR):
+        raise FileNotFoundError(f"未找到输入目录: {INPUT_DIR}")
+
+    test_paths = ((FFMPEG_PATH, "ffmpeg"), (FFPROBE_PATH, "ffprobe"))
+    for tool_path, tool_name in test_paths:
+        result = run_command([tool_path, "-version"], check=False)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"{tool_name} 无法执行，退出码 {result.returncode}。"
+            )
 
 
 def probe_media(video_path):
@@ -175,6 +227,22 @@ def build_segments(duration, kept_times):
 
 def format_seconds(value):
     return f"{value:.6f}".rstrip("0").rstrip(".") or "0"
+
+
+def format_hms(total_seconds):
+    hours, remainder = divmod(int(total_seconds), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours} 小时 {minutes} 分 {seconds} 秒"
+
+
+def format_eta(seconds):
+    if seconds <= 0:
+        return "0 分 0 秒"
+    minutes, remain_seconds = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours} 小时 {minutes} 分 {remain_seconds} 秒"
+    return f"{minutes} 分 {remain_seconds} 秒"
 
 
 def get_effective_segments(segments):
@@ -361,79 +429,82 @@ def summarize_segments(segments):
     }
 
 
-def render_with_size_guard(video_path, output_path, media_info, segments):
+def render_with_size_guard(video_path, output_path, media_info, segments, logger):
     source_size = os.path.getsize(video_path)
-    temp_dir = tempfile.mkdtemp(prefix="compact_video_", dir=OUTPUT_DIR)
-    best_output = None
+    temp_dir = tempfile.mkdtemp(prefix="compact_video_")
 
     try:
         temp_output = os.path.join(temp_dir, f"render_cq_{FIXED_CQ}.mp4")
         cmd = build_ffmpeg_command(video_path, temp_output, media_info, segments, FIXED_CQ)
-        print(f"    - 使用 CQ={FIXED_CQ} 编码中...")
+        logger(f"    - 使用 CQ={FIXED_CQ} 编码中...")
         result = run_command(cmd, check=False)
         if result.returncode != 0:
-            print(result.stderr)
+            logger(result.stderr)
             raise RuntimeError(f"ffmpeg 编码失败，退出码 {result.returncode}")
 
         output_size = os.path.getsize(temp_output)
-        print(f"    - 输出大小 {output_size / 1024 / 1024:.2f} MB，原始大小 {source_size / 1024 / 1024:.2f} MB")
+        logger(f"    - 输出大小 {output_size / 1024 / 1024:.2f} MB，原始大小 {source_size / 1024 / 1024:.2f} MB")
 
         if output_size <= source_size:
             shutil.move(temp_output, output_path)
-            best_output = output_path
+            return "encoded"
         else:
             shutil.copy2(video_path, output_path)
-            best_output = output_path
-            print("    - CQ=20 输出大于原文件，已回退为复制原文件。")
+            logger("    - CQ=20 输出大于原文件，已回退为直接复制源文件到 output。")
+            return "copied_fallback"
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def process_one_video(video_path):
+    started_at = time.perf_counter()
     filename = os.path.basename(video_path)
     output_path = os.path.join(OUTPUT_DIR, f"compact_{filename}")
-    empty_marker_path = output_path + ".empty"
 
-    print(f"\n>>> 正在处理: {filename}")
-    media_info = probe_media(video_path)
-    duration = float(media_info["format"]["duration"])
+    def vlog(message):
+        print(f"[{filename}] {message}")
 
-    kept_times = detect_kept_frame_times(video_path)
-    segments = build_segments(duration, kept_times)
-    summary = summarize_segments(segments)
+    print(f"\n[{filename}] >>> 正在处理")
+    try:
+        media_info = probe_media(video_path)
+        duration = float(media_info["format"]["duration"])
 
-    print(
-        "    - 检测结果: "
-        f"{summary['static_count']} 段静止区间, "
-        f"合计 {summary['static_input_total']:.2f}s -> {summary['static_output_total']:.2f}s"
-    )
-    print(
-        "    - 处理模式: "
-        + ("直接裁剪静止段" if STATIC_SEGMENT_MODE == "drop" else f"静止段 {STATIC_SPEED}x 倍速")
-    )
+        kept_times = detect_kept_frame_times(video_path)
+        segments = build_segments(duration, kept_times)
+        summary = summarize_segments(segments)
 
-    if is_entire_video_static(segments, duration):
-        if os.path.exists(output_path):
-            os.remove(output_path)
-        with open(empty_marker_path, "w", encoding="utf-8") as marker_file:
-            marker_file.write("entire video detected as static\n")
-        print(f"    - 整个视频均为静止，已跳过并生成标记: {os.path.basename(empty_marker_path)}")
-        return
+        vlog(
+            "    - 检测结果: "
+            f"{summary['static_count']} 段静止区间, "
+            f"合计 {summary['static_input_total']:.2f}s -> {summary['static_output_total']:.2f}s"
+        )
+        vlog(
+            "    - 处理模式: "
+            + ("直接裁剪静止段" if STATIC_SEGMENT_MODE == "drop" else f"静止段 {STATIC_SPEED}x 倍速")
+        )
 
-    if summary["static_count"] == 0:
-        if os.path.exists(empty_marker_path):
-            os.remove(empty_marker_path)
-        shutil.copy2(video_path, output_path)
-        print("    - 未发现超过 3 秒的静止区间，已直接复制到 output。")
-        return
+        if is_entire_video_static(segments, duration):
+            vlog("    - 整个视频均为静止，已跳过，不输出到 output。")
+            vlog(f"    - 未生成输出文件: {os.path.basename(output_path)}")
+            return "all_static"
 
-    if os.path.exists(empty_marker_path):
-        os.remove(empty_marker_path)
-    render_with_size_guard(video_path, output_path, media_info, segments)
-    print(f"    - 完成输出: {os.path.basename(output_path)}")
+        if summary["static_count"] == 0:
+            shutil.copy2(video_path, output_path)
+            vlog("    - 未发现超过 3 秒的静止区间，已直接复制源文件到 output。")
+            return "copied_no_static"
+
+        with ENCODE_SEMAPHORE:
+            result = render_with_size_guard(video_path, output_path, media_info, segments, vlog)
+        vlog(f"    - 完成输出: {os.path.basename(output_path)}")
+        return result
+    finally:
+        elapsed_seconds = int(time.perf_counter() - started_at)
+        minutes, seconds = divmod(elapsed_seconds, 60)
+        vlog(f"    - 当前视频耗时: {minutes} 分 {seconds} 秒")
 
 
 def process_videos():
+    started_at = time.perf_counter()
     ensure_output_dir()
     video_files = sorted(glob.glob(os.path.join(INPUT_DIR, "*.mp4")))
 
@@ -441,22 +512,106 @@ def process_videos():
         print(f"错误: 未在 {INPUT_DIR} 中找到 mp4 文件。")
         return
 
-    print(f"找到 {len(video_files)} 个视频，准备开始处理...")
-    success_count = 0
-
+    existing_outputs = {
+        name for name in os.listdir(OUTPUT_DIR)
+        if name.lower().endswith(".mp4") and name.startswith("compact_")
+    }
+    skipped_existing_count = 0
+    pending_video_files = []
     for video_path in video_files:
-        try:
-            process_one_video(video_path)
-            success_count += 1
-        except Exception as exc:
-            print(f"    - 失败: {os.path.basename(video_path)}")
-            print(f"      原因: {exc}")
+        filename = os.path.basename(video_path)
+        compact_name = f"compact_{filename}"
+        if compact_name in existing_outputs:
+            skipped_existing_count += 1
+            print(f"[{filename}] >>> 已跳过，output 已存在同名文件: {compact_name}")
+        else:
+            pending_video_files.append(video_path)
+
+    print(f"找到 {len(video_files)} 个视频，其中 {len(pending_video_files)} 个待处理，{skipped_existing_count} 个已存在输出而跳过。")
+    if not pending_video_files:
+        print("无需处理，全部视频在 output 中已有对应 compact 文件。")
+        return
+
+    success_count = 0
+    all_static_count = 0
+    copied_no_static_count = 0
+    copied_fallback_count = 0
+    encoded_count = 0
+    failed_videos = []
+    completed_count = 0
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_map = {executor.submit(process_one_video, video_path): video_path for video_path in pending_video_files}
+        for future in as_completed(future_map):
+            video_path = future_map[future]
+            completed_count += 1
+            try:
+                result = future.result()
+                success_count += 1
+                if result == "all_static":
+                    all_static_count += 1
+                elif result == "copied_no_static":
+                    copied_no_static_count += 1
+                elif result == "copied_fallback":
+                    copied_fallback_count += 1
+                elif result == "encoded":
+                    encoded_count += 1
+            except Exception as exc:
+                failed_videos.append((os.path.basename(video_path), str(exc)))
+                print(f"[{os.path.basename(video_path)}]    - 失败: {exc}")
+
+            elapsed = time.perf_counter() - started_at
+            avg_per_video = elapsed / completed_count if completed_count else 0
+            remaining = len(pending_video_files) - completed_count
+            eta_seconds = avg_per_video * remaining
+            print(
+                f"[进度] {completed_count}/{len(pending_video_files)} 已完成, "
+                f"ETA 约 {format_eta(eta_seconds)}"
+            )
+
+    total_elapsed_seconds = int(time.perf_counter() - started_at)
+    total_elapsed_hours = total_elapsed_seconds / 3600.0
+    normal_processed_count = success_count - all_static_count
+    copied_source_count = copied_no_static_count + copied_fallback_count
 
     print("\n" + "=" * 36)
-    print(f"处理完成: {success_count}/{len(video_files)}")
+    print(f"处理完成: {success_count}/{len(pending_video_files)}")
+    print(f"总视频数: {len(video_files)}")
+    print(f"已存在输出跳过数: {skipped_existing_count}")
+    print(f"正常处理数: {normal_processed_count}")
+    print(f"编码压缩输出数: {encoded_count}")
+    print(f"直接复制源文件数(合计): {copied_source_count}")
+    print(f"  - 无静止区间直接复制: {copied_no_static_count}")
+    print(f"  - 编码变大回退复制: {copied_fallback_count}")
+    print(f"全静止跳过数: {all_static_count}")
+    print(f"总耗时: {total_elapsed_hours:.2f} 小时")
+    print(f"总耗时(时分秒): {format_hms(total_elapsed_seconds)}")
     print(f"输出目录: {OUTPUT_DIR}")
+    print(f"日志目录: {LOG_DIR}")
+    if failed_videos:
+        print("失败清单:")
+        for failed_name, failed_reason in failed_videos:
+            print(f"  - {failed_name}: {failed_reason}")
+    else:
+        print("失败清单: 无")
     print("=" * 36)
 
 
 if __name__ == "__main__":
-    process_videos()
+    ensure_output_dir()
+    ensure_log_dir()
+    log_filename = f"run_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+    log_path = os.path.join(LOG_DIR, log_filename)
+    with open(log_path, "w", encoding="utf-8") as log_file:
+        tee = TeeWriter(sys.stdout, log_file)
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        sys.stdout = tee
+        sys.stderr = tee
+        try:
+            print(f"运行日志文件: {log_path}")
+            validate_environment()
+            process_videos()
+        finally:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
