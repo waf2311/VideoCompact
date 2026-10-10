@@ -160,7 +160,15 @@ dist\VideoCompact\
 
 ### 拉取与准备
 
+> `ffmpeg.7z` / `ffprobe.7z` 通过 **Git LFS** 存储。克隆前请先安装 [Git LFS](https://git-lfs.com/)
+> 并执行一次 `git lfs install`，否则拉下来的只是指针文件（体积很小、无法解压）。
+
 ```powershell
+# 安装 Git LFS（仅首次需要）
+winget install GitHub.GitLFS
+git lfs install
+
+# 克隆仓库（LFS 文件会自动拉取）
 git clone https://github.com/waf2311/VideoCompact.git
 cd VideoCompact
 
@@ -302,7 +310,7 @@ STATIC_SEGMENT_MODE = "drop"
 - `input/`：待处理视频目录
 - `output/`：输出目录
 - `detect/`：检测结果缓存目录（运行后自动生成）
-- `ffmpeg.7z` / `ffprobe.7z`：`ffmpeg.exe` / `ffprobe.exe` 压缩包（随仓库提供，源码运行前需先解压到根目录）
+- `ffmpeg.7z` / `ffprobe.7z`：`ffmpeg.exe` / `ffprobe.exe` 压缩包（随仓库提供，由 **Git LFS** 存储，源码运行前需先解压到根目录）
 
 ## License
 
