@@ -42,13 +42,16 @@ VideoCompact/
 ├─ src/
 │  ├─ gui.py            （图形界面入口）
 │  └─ core.py           （核心处理逻辑）
-├─ assets/             （图标）
-├─ docs/               （文档图片）
-├─ input/              （待处理视频目录）
-├─ output/             （输出目录）
-├─ VideoCompact.spec   （PyInstaller 打包配置）
-├─ build.bat           （一键打包脚本，双击运行）
-└─ .github/workflows/  （GitHub Actions 自动发布）
+├─ assets/              （图标）
+├─ docs/                （README 图片）
+├─ input/               （待处理视频目录）
+├─ output/              （输出目录）
+├─ ffmpeg.7z            （ffmpeg.exe 压缩包，Git LFS 存储）
+├─ ffprobe.7z           （ffprobe.exe 压缩包，Git LFS 存储）
+├─ VideoCompact.spec    （PyInstaller 打包配置）
+├─ build.bat            （一键打包脚本，双击运行）
+├─ LICENSE
+└─ .github/workflows/   （GitHub Actions 自动发布）
 ```
 
 运行后会在项目根目录（打包版为 exe 同级）自动生成：
@@ -234,14 +237,14 @@ compact_00_20251205124427_20251205125902.mp4
 
 ### 2. 如果处理后比原文件更大
 
-脚本不会继续尝试别的档位，而是：
+软件不会继续尝试别的档位，而是：
 
 - 直接复制 `input` 中的原文件到 `output`
 - 文件名仍然是 `compact_<源文件名>`
 
 ### 3. 如果整个视频都被判定为静止
 
-脚本不会输出视频文件，而是在 `output` 中生成一个标记文件：
+软件不会输出视频文件，而是在 `output` 中生成一个标记文件：
 
 ```text
 compact_<源文件名>.empty
@@ -257,7 +260,7 @@ compact_00_20251205124427_20251205125902.mp4.empty
 
 ### 静止检测
 
-脚本会先做一个仅用于检测的低成本分析：
+软件会先做一个仅用于检测的低成本分析：
 
 - 优先用 NVIDIA GPU（NVDEC）硬解，失败则自动回退到 CPU 软解
 - 先降到 `5fps`，再缩小分辨率并轻微模糊
@@ -293,7 +296,7 @@ STATIC_SEGMENT_MODE = "drop"
 
 ## 注意事项
 
-- 当前脚本主要针对小米摄像机导出的 `4K H.265 mp4` 录像设计
+- 当前软件主要针对小米摄像机导出的 `4K H.265 mp4` 录像设计
 - 重新编码后，不可能在数学意义上做到绝对 `100%` 无损
 - 当前策略已经尽量保持编码格式、分辨率、像素格式不变，音频规格尽量一致
 - 如果你的显卡或驱动不支持 `hevc_nvenc`，重编码会失败
