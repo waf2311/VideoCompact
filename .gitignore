@@ -14,9 +14,6 @@ detect/
 *.empty
 *.tmp
 
-# 大文件压缩包（改由 GitHub Release 附件分发）
-*.7z
-
 # 编辑器 / IDE
 .idea/
 .vscode/

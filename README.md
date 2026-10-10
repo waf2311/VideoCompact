@@ -87,11 +87,13 @@ VideoCompact/
 
 ### 方式二：从源码运行
 
+仓库内已包含 `ffmpeg.7z` / `ffprobe.7z`，无需另外下载。更多本地开发细节见下方[「本地开发」](#本地开发)。
+
 ```powershell
-# 1. 安装依赖
+# 1. 安装运行时依赖
 python -m pip install pystray pillow
 
-# 2. 到 Releases 页面下载 ffmpeg.7z 和 ffprobe.7z，解压到项目根目录
+# 2. 解压仓库根目录中的 ffmpeg.7z / ffprobe.7z 到项目根目录
 #    解压后需要能看到 ffmpeg.exe 和 ffprobe.exe
 
 # 3. 启动图形界面
@@ -147,6 +149,64 @@ dist\VideoCompact\
 - 打开的 exe 就是 `VideoCompact.exe` 一个文件，所有依赖都在 `bin\` 里，ffmpeg / ffprobe 也可以直接替换
 - 打包体积较大（约 450 MB），因为 `bin\` 里包含完整的 ffmpeg / ffprobe
 - 打包细节见 `VideoCompact.spec`
+
+## 本地开发
+
+### 环境要求
+
+- Windows 10 / 11
+- Python 3.11+
+- NVIDIA 显卡 + 较新驱动（检测走 GPU、编码走 NVENC；检测失败会自动回退 CPU，但重编码必须支持 `hevc_nvenc`）
+
+### 拉取与准备
+
+```powershell
+git clone https://github.com/waf2311/VideoCompact.git
+cd VideoCompact
+
+# 解压随仓库提供的 ffmpeg（在根目录得到 ffmpeg.exe / ffprobe.exe）
+# 用 7-Zip 解压，例如：
+#   & "C:\Program Files\7-Zip\7z.exe" x ffmpeg.7z
+#   & "C:\Program Files\7-Zip\7z.exe" x ffprobe.7z
+
+# 创建虚拟环境并安装运行时依赖
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install pystray pillow
+```
+
+### 运行与调试
+
+```powershell
+# 图形界面（唯一入口）
+python src/gui.py
+```
+
+### 打包
+
+```powershell
+# 双击 build.bat，或在项目根目录执行：
+powershell -ExecutionPolicy Bypass -File build.ps1
+
+# 使用官方 PyPI（默认走清华镜像）
+powershell -ExecutionPolicy Bypass -File build.ps1 -PipIndexUrl ""
+```
+
+打包依赖 `pyinstaller`、`pystray`、`pillow`，脚本会自动安装；产物见 `dist\VideoCompact\`。
+
+### 代码结构
+
+- `src/gui.py`：Tkinter 界面、系统托盘、暂停 / 停止控制；启动时把界面选项写回 `core` 模块。
+- `src/core.py`：静止检测（`mpdecimate`）与编码（NVENC 重编码 / 无损流复制）的全部逻辑。
+  - 目录解析：源码态 `BASE_DIR` 为项目根目录、静态资源在 `assets/`；打包态可写目录在 exe 同级、资源在 `_MEIPASS`。
+  - 关键配置集中在文件顶部「配置区」，详见[「可调参数」](#可调参数)。
+- `VideoCompact.spec`：PyInstaller 配置（入口 `src/gui.py`，运行时依赖打入 `bin\`）。
+- `.github/workflows/release.yml`：推送 `v*` tag 时在 `windows-latest` 上自动打包并发布 Release。
+
+### 提交约定
+
+- 不要提交 `ffmpeg.exe` / `ffprobe.exe` / `build/` / `dist/` / `detect/`（已在 `.gitignore` 中忽略）。
+- `input/`、`output/` 仅保留 `.gitkeep`，不要提交实际视频。
 
 ## 输出规则
 
@@ -242,7 +302,7 @@ STATIC_SEGMENT_MODE = "drop"
 - `input/`：待处理视频目录
 - `output/`：输出目录
 - `detect/`：检测结果缓存目录（运行后自动生成）
-- `ffmpeg.7z` / `ffprobe.7z`：`ffmpeg.exe` / `ffprobe.exe` 压缩包（Release 附件，源码运行需先解压）
+- `ffmpeg.7z` / `ffprobe.7z`：`ffmpeg.exe` / `ffprobe.exe` 压缩包（随仓库提供，源码运行前需先解压到根目录）
 
 ## License
 
