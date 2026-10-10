@@ -1,0 +1,249 @@
+# VideoCompact
+
+![Example](./docs/example.png)
+
+[![Release](https://img.shields.io/github/v/release/waf2311/VideoCompact?label=release)](https://github.com/waf2311/VideoCompact/releases)
+[![License](https://img.shields.io/github/license/waf2311/VideoCompact)](./LICENSE)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20NVIDIA-blue)
+
+用于批量处理小米摄像机导出的 `H.265 / HEVC 4K mp4` 录像。
+
+软件会扫描 `input` 目录中的所有 `mp4` 文件，识别其中连续静止超过 3 秒的片段，并按规则压缩时间轴后输出到 `output` 目录。
+
+当前默认规则：
+
+- 运动画面保留正常速度
+- 静止画面直接从时间线上裁掉
+- 提供两种输出模式（`OUTPUT_MODE`）：
+  - `reencode`（默认）：重编码，体积最小，画质有极小损失
+  - `lossless`：无损裁剪，画质与源 100% 一致，但省得少
+- 输出视频保持 `H.265 / HEVC`，分辨率不变
+- 输出帧率保持源时间基（`-fps_mode vfr`，不再强制补到固定帧率）
+- 正常速度片段保留音频
+- 检测优先用 NVIDIA GPU 解码，失败自动回退 CPU
+- 如果处理后文件比原文件更大，则直接复制源文件到 `output`
+
+> 本软件只提供图形界面（GUI）一种使用方式，打开后选择目录点击「开始」即可。
+
+### 关于两种输出模式
+
+HEVC 重编码在数学上**一定会有损**，无法做到和源「一模一样」。因此：
+
+- `reencode`：用 GPU（`hevc_nvenc`）重编码。`CQ=20` 作为画质上限，并叠加「按源文件推算的码率上限」，
+  保证输出体积不超过源文件的 `ENCODE_SIZE_RATIO` 倍。可以按秒精确裁剪，省得最多（约 40~58%）。
+- `lossless`：**完全不重编码**，直接流复制（stream copy）。画质与源 100% 一致、速度极快，
+  但只能在关键帧处切；小米摄像机 GOP 固定 **6 秒**，所以静止段只能按 6 秒整数倍删除，
+  会有残留静止、省得少（实测约 0~25%）。
+
+## 目录结构
+
+```text
+VideoCompact/
+├─ src/
+│  ├─ gui.py            （图形界面入口）
+│  └─ core.py           （核心处理逻辑）
+├─ assets/             （图标）
+├─ docs/               （文档图片）
+├─ input/              （待处理视频目录）
+├─ output/             （输出目录）
+├─ VideoCompact.spec   （PyInstaller 打包配置）
+├─ build.ps1           （一键打包脚本）
+├─ build.bat           （双击即可打包的入口）
+└─ .github/workflows/  （GitHub Actions 自动发布）
+```
+
+运行后会在项目根目录（打包版为 exe 同级）自动生成：
+
+- `detect/`：检测结果缓存目录
+
+## 依赖
+
+- `Python 3`（源码运行 / 打包时需要）
+- `ffmpeg.exe`、`ffprobe.exe`（运行时需要，Windows）
+
+说明：
+
+- `ffmpeg.exe` 用于静止检测、裁剪拼接、音视频处理、GPU 编码
+- `ffprobe.exe` 用于读取视频时长、流信息、码率等元数据
+
+## 快速开始
+
+### 方式一：直接下载打包版（推荐，免 Python 环境）
+
+1. 打开 [Releases](https://github.com/waf2311/VideoCompact/releases) 下载最新的 `VideoCompact-*-win64.zip`
+2. 解压后目录结构如下，双击 `VideoCompact.exe` 即可运行：
+
+```text
+VideoCompact/
+├─ VideoCompact.exe   外部唯一的 exe，双击运行
+├─ bin/               核心依赖（Python 运行时 + ffmpeg.exe + ffprobe.exe + 图标）
+├─ input/             默认输入目录（放视频）
+└─ output/            默认输出目录
+```
+
+打开后默认的输入 / 输出目录就是同级的 `input` / `output`。
+
+> 目标电脑需要有 NVIDIA 显卡与较新的驱动（检测 / 编码走 GPU；检测失败会自动回退 CPU，编码需要 NVENC）。
+
+### 方式二：从源码运行
+
+```powershell
+# 1. 安装依赖
+python -m pip install pystray pillow
+
+# 2. 到 Releases 页面下载 ffmpeg.7z 和 ffprobe.7z，解压到项目根目录
+#    解压后需要能看到 ffmpeg.exe 和 ffprobe.exe
+
+# 3. 启动图形界面
+python src/gui.py
+```
+
+## 使用方法（图形界面）
+
+界面功能：
+
+- 选择输出模式，默认 `重编码`（体积最小），另一个是 `无损裁剪`（画质与源一致）
+- 选择输入目录和输出目录；打包版打开时默认就是 exe 同级的 `input` / `output`
+- 「高级选项」卡片（仅在「重编码」模式下显示）：
+  - 静止判定阈值（秒）
+  - 静止段处理方式（直接裁掉 / 倍速保留）与倍速倍数
+- 下方实时显示日志输出
+- 支持 `暂停` / `继续`（暂停会真正挂起当前 ffmpeg 进程）/ `停止`
+- 支持最小化到系统托盘：点击最小化或关闭窗口都会缩进托盘；托盘菜单可显示主界面、暂停、继续、退出
+
+## 打包成 exe（免 Python 环境）
+
+打包后会生成一个自带运行环境的文件夹，复制到其他 Windows 电脑上双击即可运行，无需安装 Python。
+
+1. 先把 `ffmpeg.7z`、`ffprobe.7z` 解压到项目根目录
+2. 任选一种方式运行打包脚本：
+
+```powershell
+# 方式 A：双击 build.bat
+# 方式 B：右键 build.ps1 -> “使用 PowerShell 运行”
+# 方式 C：在项目根目录执行
+powershell -ExecutionPolicy Bypass -File build.ps1
+
+# 如需使用官方 PyPI（默认使用清华镜像）：
+powershell -ExecutionPolicy Bypass -File build.ps1 -PipIndexUrl ""
+```
+
+> 脚本结束会停在“按回车键退出”，不会一闪而过。
+
+3. 产物布局如下，把整个 `VideoCompact` 文件夹复制到目标电脑：
+
+```text
+dist\VideoCompact\
+├─ VideoCompact.exe   外部唯一的 exe，双击运行
+├─ bin\               核心依赖（Python 运行时 + ffmpeg.exe + ffprobe.exe + 图标）
+├─ input\             默认输入目录（放视频）
+└─ output\            默认输出目录
+```
+
+4. 双击 `VideoCompact.exe` 运行
+
+说明：
+
+- 打开的 exe 就是 `VideoCompact.exe` 一个文件，所有依赖都在 `bin\` 里，ffmpeg / ffprobe 也可以直接替换
+- 打包体积较大（约 450 MB），因为 `bin\` 里包含完整的 ffmpeg / ffprobe
+- 打包细节见 `VideoCompact.spec`
+
+## 输出规则
+
+### 1. 正常处理成功
+
+输出文件名格式：
+
+```text
+compact_<源文件名>
+```
+
+例如：
+
+```text
+compact_00_20251205124427_20251205125902.mp4
+```
+
+### 2. 如果处理后比原文件更大
+
+脚本不会继续尝试别的档位，而是：
+
+- 直接复制 `input` 中的原文件到 `output`
+- 文件名仍然是 `compact_<源文件名>`
+
+### 3. 如果整个视频都被判定为静止
+
+脚本不会输出视频文件，而是在 `output` 中生成一个标记文件：
+
+```text
+compact_<源文件名>.empty
+```
+
+例如：
+
+```text
+compact_00_20251205124427_20251205125902.mp4.empty
+```
+
+## 当前处理逻辑
+
+### 静止检测
+
+脚本会先做一个仅用于检测的低成本分析：
+
+- 优先用 NVIDIA GPU（NVDEC）硬解，失败则自动回退到 CPU 软解
+- 先降到 `5fps`，再缩小分辨率并轻微模糊
+- 最后使用 `mpdecimate` 判断静止区间
+
+这一步只用于判断静止与否，不影响最终输出画质。检测结果会缓存到 `detect/` 目录，重复运行不会重复检测。
+
+### 时间轴处理
+
+当前默认模式为：
+
+```python
+STATIC_SEGMENT_MODE = "drop"
+```
+
+表示静止段直接裁掉、只保留运动段。如果以后想改成“静止段保留，但加速播放”，可以把这个值改成 `"speedup"`。
+
+## 可调参数
+
+可以在 `src/core.py` 里修改这些参数：
+
+- `OUTPUT_MODE`：`"reencode"`（默认）/ `"lossless"`
+- `STATIC_SEGMENT_MODE`：`"drop"`（默认）/ `"speedup"`
+- `STATIC_MIN_SECONDS`：连续静止超过多少秒才处理，默认 `3.0`
+- `STATIC_SPEED`：`"speedup"` 模式下的倍速，默认 `8.0`
+- `DETECTION_USE_GPU`：检测阶段是否优先使用 GPU 解码，默认 `True`
+- `DETECT_DIR`：检测结果缓存目录，默认项目下的 `detect/`
+- `MAX_ENCODE_JOBS`：编码并发数量（NVENC 限流，建议 1-2），默认 `1`
+- `FIXED_CQ`：编码画质上限，默认 `20`
+- `ENCODE_SIZE_RATIO`：输出体积相对源文件的上限比例，默认 `1.0`
+- `ENCODE_MIN_MAXRATE` / `ENCODE_MAX_MAXRATE`：码率上限的下限 / 上限兜底
+- `ENCODE_PRESET`：NVENC 编码预设，默认 `p5`
+
+## 注意事项
+
+- 当前脚本主要针对小米摄像机导出的 `4K H.265 mp4` 录像设计
+- 重新编码后，不可能在数学意义上做到绝对 `100%` 无损
+- 当前策略已经尽量保持编码格式、分辨率、像素格式不变，音频规格尽量一致
+- 如果你的显卡或驱动不支持 `hevc_nvenc`，重编码会失败
+
+## 文件说明
+
+- `src/gui.py`：图形界面入口
+- `src/core.py`：核心处理逻辑
+- `VideoCompact.spec`：PyInstaller 打包配置
+- `build.ps1`：一键打包脚本
+- `build.bat`：双击即可打包的入口（内部调用 build.ps1）
+- `assets/`：应用与托盘图标
+- `docs/`：README 图片
+- `input/`：待处理视频目录
+- `output/`：输出目录
+- `detect/`：检测结果缓存目录（运行后自动生成）
+- `ffmpeg.7z` / `ffprobe.7z`：`ffmpeg.exe` / `ffprobe.exe` 压缩包（Release 附件，源码运行需先解压）
+
+## License
+
+[MIT](./LICENSE)

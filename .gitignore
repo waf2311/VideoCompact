@@ -1,0 +1,22 @@
+# 运行 / 打包产物
+ffmpeg.exe
+ffprobe.exe
+build/
+dist/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 本地运行数据
+detect/
+*.mp4
+*.empty
+*.tmp
+
+# 大文件压缩包（改由 GitHub Release 附件分发）
+*.7z
+
+# 编辑器 / IDE
+.idea/
+.vscode/
