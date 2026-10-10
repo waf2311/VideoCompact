@@ -4,7 +4,7 @@
 
 [![Release](https://img.shields.io/github/v/release/waf2311/VideoCompact?label=release)](https://github.com/waf2311/VideoCompact/releases)
 [![License](https://img.shields.io/github/license/waf2311/VideoCompact)](./LICENSE)
-![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20NVIDIA-blue)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20NVIDIA%20%7C%20AMD%20%7C%20CPU-blue)
 
 用于批量处理小米摄像机导出的 `H.265 / HEVC 4K mp4` 录像。
 
@@ -29,7 +29,7 @@
 
 HEVC 重编码在数学上**一定会有损**，无法做到和源「一模一样」。因此：
 
-- `reencode`：用 GPU（`hevc_nvenc`）重编码。`CQ=20` 作为画质上限，并叠加「按源文件推算的码率上限」，
+- `reencode`：按编码器候选链（`hevc_nvenc` -> `hevc_amf` -> `libx265`）重编码。`CQ=20` 作为画质上限，并叠加「按源文件推算的码率上限」，
   保证输出体积不超过源文件的 `ENCODE_SIZE_RATIO` 倍。可以按秒精确裁剪，省得最多（约 40~58%）。
 - `lossless`：**完全不重编码**，直接流复制（stream copy）。画质与源 100% 一致、速度极快，
   但只能在关键帧处切；小米摄像机 GOP 固定 **6 秒**，所以静止段只能按 6 秒整数倍删除，
@@ -85,7 +85,7 @@ VideoCompact/
 
 打开后默认的输入 / 输出目录就是同级的 `input` / `output`。
 
-> 目标电脑需要有 NVIDIA 显卡与较新的驱动（检测 / 编码走 GPU；检测失败会自动回退 CPU，编码需要 NVENC）。
+> 目标电脑建议有 NVIDIA 或 AMD 显卡与较新的驱动（检测 / 编码优先走 GPU；检测失败自动回退 CPU，编码失败按候选链自动回退，最差用 CPU `libx265` 编码，速度会慢很多）。
 
 ### 方式二：从源码运行
 
@@ -159,7 +159,7 @@ dist\VideoCompact\
 
 - Windows 10 / 11
 - Python 3.11+
-- NVIDIA 显卡 + 较新驱动（检测走 GPU、编码走 NVENC；检测失败会自动回退 CPU，但重编码必须支持 `hevc_nvenc`）
+- 推荐 NVIDIA / AMD 显卡 + 较新驱动（检测走 GPU、编码走 NVENC / AMF；检测失败自动回退 CPU，编码失败按候选链自动回退到 CPU `libx265`）
 
 ### 拉取与准备
 
@@ -293,13 +293,15 @@ STATIC_SEGMENT_MODE = "drop"
 - `ENCODE_SIZE_RATIO`：输出体积相对源文件的上限比例，默认 `1.0`
 - `ENCODE_MIN_MAXRATE` / `ENCODE_MAX_MAXRATE`：码率上限的下限 / 上限兜底
 - `ENCODE_PRESET`：NVENC 编码预设，默认 `p5`
+- `ENCODE_CPU_PRESET`：CPU 编码（`libx265`）预设，默认 `fast`
+- `ENCODER_CANDIDATES`：编码器候选链，默认 `hevc_nvenc` -> `hevc_amf` -> `libx265`
 
 ## 注意事项
 
 - 当前软件主要针对小米摄像机导出的 `4K H.265 mp4` 录像设计
 - 重新编码后，不可能在数学意义上做到绝对 `100%` 无损
 - 当前策略已经尽量保持编码格式、分辨率、像素格式不变，音频规格尽量一致
-- 如果你的显卡或驱动不支持 `hevc_nvenc`，重编码会失败
+- 无 NVIDIA / AMD 显卡也可运行，重编码会自动回退到 CPU（`libx265`），速度明显更慢
 
 ## 文件说明
 

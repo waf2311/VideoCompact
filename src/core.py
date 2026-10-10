@@ -94,6 +94,19 @@ MOTION_GUARD_SECONDS = 0.20
 # NVENC 速度优先。p5 比 p7 明显更快，结合体积兜底更适合大批量任务。
 ENCODE_PRESET = "p5"
 
+# CPU 编码（libx265）preset。fast 在速度与压缩率之间较均衡。
+ENCODE_CPU_PRESET = "fast"
+
+# 编码器候选链，按顺序尝试：NVIDIA NVENC -> AMD AMF -> CPU libx265。
+# 某个编码器编码失败后全局切换到下一个，后续文件直接使用可用的编码器。
+ENCODER_CANDIDATES = [
+    {"name": "hevc_nvenc", "label": "NVIDIA NVENC"},
+    {"name": "hevc_amf", "label": "AMD AMF"},
+    {"name": "libx265", "label": "CPU libx265"},
+]
+_ENCODER_STATE = {"index": 0}
+_ENCODER_LOCK = threading.Lock()
+
 # CQ 作为画质上限。注意：监控源本身码率很低，纯 CQ 会把运动画面编得远大于源文件
 # （实测 CQ20 可达源的 4 倍以上），因此必须配合下面的码率上限一起使用。
 FIXED_CQ = 20
@@ -680,7 +693,60 @@ def build_filter_complex(segments, has_audio, audio_stream):
     return ";".join(filter_parts), "vout", None
 
 
-def build_ffmpeg_command(video_path, output_path, audio_info, segments, cq_value, maxrate=0):
+def build_video_encoder_args(encoder, cq_value, maxrate):
+    if encoder == "hevc_nvenc":
+        args = [
+            "-c:v",
+            encoder,
+            "-preset",
+            ENCODE_PRESET,
+            "-rc",
+            "vbr",
+            "-cq",
+            str(cq_value),
+        ]
+        # 叠加坡率上限，防止纯 CQ 在小码率监控源上体积膨胀。
+        if maxrate > 0:
+            args.extend(["-maxrate", str(maxrate), "-bufsize", str(maxrate * 2)])
+        return args
+    if encoder == "hevc_amf":
+        # AMF 的 CQP 模式按 QP 定画质，语义与 NVENC 的 CQ 接近；
+        # CQP 不支持码率上限，体积靠外层「输出大于源则回退复制」兜底。
+        return [
+            "-c:v",
+            encoder,
+            "-quality",
+            "speed",
+            "-rc",
+            "cqp",
+            "-qp_i",
+            str(cq_value),
+            "-qp_p",
+            str(cq_value),
+            "-qp_b",
+            str(cq_value),
+        ]
+    # libx265：CRF 定画质，VBV 限制峰值码率（单位 kbps）。
+    args = [
+        "-c:v",
+        encoder,
+        "-preset",
+        ENCODE_CPU_PRESET,
+        "-crf",
+        str(cq_value),
+    ]
+    if maxrate > 0:
+        vbv_maxrate = max(1, int(maxrate / 1000))
+        args.extend(
+            [
+                "-x265-params",
+                f"vbv-maxrate={vbv_maxrate}:vbv-bufsize={vbv_maxrate * 2}",
+            ]
+        )
+    return args
+
+
+def build_ffmpeg_command(video_path, output_path, audio_info, segments, cq_value, maxrate=0, encoder="hevc_nvenc"):
     has_audio = audio_info is not None
 
     filter_complex, video_label, audio_label = build_filter_complex(
@@ -702,31 +768,8 @@ def build_ffmpeg_command(video_path, output_path, audio_info, segments, cq_value
     if audio_label:
         cmd.extend(["-map", f"[{audio_label}]"])
 
-    cmd.extend(
-        [
-            "-map_metadata",
-            "0",
-            "-c:v",
-            "hevc_nvenc",
-            "-preset",
-            ENCODE_PRESET,
-            "-rc",
-            "vbr",
-            "-cq",
-            str(cq_value),
-        ]
-    )
-
-    # 叠加坡率上限，防止纯 CQ 在小码率监控源上体积膨胀。
-    if maxrate > 0:
-        cmd.extend(
-            [
-                "-maxrate",
-                str(maxrate),
-                "-bufsize",
-                str(maxrate * 2),
-            ]
-        )
+    cmd.extend(["-map_metadata", "0"])
+    cmd.extend(build_video_encoder_args(encoder, cq_value, maxrate))
 
     cmd.extend(
         [
@@ -851,16 +894,43 @@ def render_with_size_guard(
 
     try:
         temp_output = os.path.join(temp_dir, f"render_cq_{FIXED_CQ}.mp4")
-        cmd = build_ffmpeg_command(
-            video_path, temp_output, audio_info, segments, FIXED_CQ, maxrate
-        )
         rate_note = f"，码率上限 {maxrate / 1000:.0f} kbps" if maxrate > 0 else ""
-        logger(f"    - 使用 CQ={FIXED_CQ}{rate_note} 编码中...")
         on_stdout = make_progress_handler(output_duration, progress_prefix)
-        returncode, stderr_text = run_streaming(cmd, on_stdout=on_stdout)
-        if returncode != 0:
+
+        while True:
+            with _ENCODER_LOCK:
+                encoder_index = _ENCODER_STATE["index"]
+            encoder = ENCODER_CANDIDATES[encoder_index]
+
+            cmd = build_ffmpeg_command(
+                video_path,
+                temp_output,
+                audio_info,
+                segments,
+                FIXED_CQ,
+                maxrate,
+                encoder=encoder["name"],
+            )
+            logger(f"    - 使用 {encoder['label']} (CQ={FIXED_CQ}{rate_note}) 编码中...")
+            returncode, stderr_text = run_streaming(cmd, on_stdout=on_stdout)
+            if returncode == 0:
+                break
+
             logger(stderr_text)
-            raise RuntimeError(f"ffmpeg 编码失败，退出码 {returncode}")
+            with _ENCODER_LOCK:
+                can_fallback = (
+                    _ENCODER_STATE["index"] == encoder_index
+                    and encoder_index + 1 < len(ENCODER_CANDIDATES)
+                )
+                if can_fallback:
+                    _ENCODER_STATE["index"] = encoder_index + 1
+            if not can_fallback:
+                raise RuntimeError(f"ffmpeg 编码失败，退出码 {returncode}")
+
+            next_encoder = ENCODER_CANDIDATES[encoder_index + 1]
+            logger(
+                f"    - {encoder['label']} 编码不可用，回退到 {next_encoder['label']}。"
+            )
 
         output_size = os.path.getsize(temp_output)
         logger(f"    - 输出大小 {output_size / 1024 / 1024:.2f} MB，原始大小 {source_size / 1024 / 1024:.2f} MB")
