@@ -126,6 +126,11 @@ ENCODE_MIN_MAXRATE = 500000
 # 4K 监控重编码给 100 Mbps 已非常充裕。
 ENCODE_MAX_MAXRATE = 100000000
 
+# AMF 的 CQP 是固定 QP、不吃码率上限，体积超标时不会自动收敛。
+# 兜底改用 vbr_peak 目标码率时，AMF 实测平均码率会高于目标约 8%，
+# 因此目标按额度打折，保证兜底方案总体积不超过源文件。
+ENCODE_CAPPED_TARGET_RATIO = 0.9
+
 # 编码并发槽位（NVENC 限流，建议 1-2）。
 MAX_ENCODE_JOBS = 1
 
@@ -693,7 +698,13 @@ def build_filter_complex(segments, has_audio, audio_stream):
     return ";".join(filter_parts), "vout", None
 
 
-def build_video_encoder_args(encoder, cq_value, maxrate):
+def build_video_encoder_attempts(encoder, cq_value, maxrate):
+    """返回该编码器的参数候选，按「画质优先 -> 码率上限兜底」排序。
+
+    - NVENC / libx265 原生支持「画质 + 码率上限」，一次即可。
+    - AMF 的 CQP 是固定 QP、不吃码率上限，体积超标时不会自动收敛，
+      因此追加一个 vbr_peak 上限方案兜底，避免直接回退为复制源文件。
+    """
     if encoder == "hevc_nvenc":
         args = [
             "-c:v",
@@ -708,24 +719,51 @@ def build_video_encoder_args(encoder, cq_value, maxrate):
         # 叠加坡率上限，防止纯 CQ 在小码率监控源上体积膨胀。
         if maxrate > 0:
             args.extend(["-maxrate", str(maxrate), "-bufsize", str(maxrate * 2)])
-        return args
+        return [("CQ", args)]
+
     if encoder == "hevc_amf":
-        # AMF 的 CQP 模式按 QP 定画质，语义与 NVENC 的 CQ 接近；
-        # CQP 不支持码率上限，体积靠外层「输出大于源则回退复制」兜底。
-        return [
-            "-c:v",
-            encoder,
-            "-quality",
-            "speed",
-            "-rc",
-            "cqp",
-            "-qp_i",
-            str(cq_value),
-            "-qp_p",
-            str(cq_value),
-            "-qp_b",
-            str(cq_value),
+        attempts = [
+            (
+                "CQP",
+                [
+                    "-c:v",
+                    encoder,
+                    "-quality",
+                    "speed",
+                    "-rc",
+                    "cqp",
+                    "-qp_i",
+                    str(cq_value),
+                    "-qp_p",
+                    str(cq_value),
+                    "-qp_b",
+                    str(cq_value),
+                ],
+            )
         ]
+        if maxrate > 0:
+            target = max(1, int(maxrate * ENCODE_CAPPED_TARGET_RATIO))
+            attempts.append(
+                (
+                    "VBR 上限",
+                    [
+                        "-c:v",
+                        encoder,
+                        "-quality",
+                        "speed",
+                        "-rc",
+                        "vbr_peak",
+                        "-b:v",
+                        str(target),
+                        "-maxrate",
+                        str(maxrate),
+                        "-bufsize",
+                        str(maxrate * 2),
+                    ],
+                )
+            )
+        return attempts
+
     # libx265：CRF 定画质，VBV 限制峰值码率（单位 kbps）。
     args = [
         "-c:v",
@@ -743,10 +781,10 @@ def build_video_encoder_args(encoder, cq_value, maxrate):
                 f"vbv-maxrate={vbv_maxrate}:vbv-bufsize={vbv_maxrate * 2}",
             ]
         )
-    return args
+    return [("CRF", args)]
 
 
-def build_ffmpeg_command(video_path, output_path, audio_info, segments, cq_value, maxrate=0, encoder="hevc_nvenc"):
+def build_ffmpeg_command(video_path, output_path, audio_info, segments, video_encoder_args):
     has_audio = audio_info is not None
 
     filter_complex, video_label, audio_label = build_filter_complex(
@@ -769,7 +807,7 @@ def build_ffmpeg_command(video_path, output_path, audio_info, segments, cq_value
         cmd.extend(["-map", f"[{audio_label}]"])
 
     cmd.extend(["-map_metadata", "0"])
-    cmd.extend(build_video_encoder_args(encoder, cq_value, maxrate))
+    cmd.extend(video_encoder_args)
 
     cmd.extend(
         [
@@ -885,6 +923,45 @@ def detection_is_fresh(video_path):
     return record.get("source_size") == os.path.getsize(video_path)
 
 
+def render_with_encoder(
+    video_path, output_path, temp_output, encoder, audio_info, segments,
+    maxrate, source_size, on_stdout, logger,
+):
+    """用单个编码器渲染，按候选参数依次尝试。
+
+    返回 ("encoded", None) 成功并已写出 output；
+    返回 ("oversize", None) 编码成功但体积仍大于源文件；
+    返回 ("failed", 原因) 编码器不可用。
+    """
+    rate_note = f"，码率上限 {maxrate / 1000:.0f} kbps" if maxrate > 0 else ""
+    attempts = build_video_encoder_attempts(encoder["name"], FIXED_CQ, maxrate)
+
+    for attempt_index, (label, video_args) in enumerate(attempts):
+        cmd = build_ffmpeg_command(
+            video_path, temp_output, audio_info, segments, video_args
+        )
+        logger(
+            f"    - 使用 {encoder['label']} {label} (CQ={FIXED_CQ}{rate_note}) 编码中..."
+        )
+        returncode, stderr_text = run_streaming(cmd, on_stdout=on_stdout)
+        if returncode != 0:
+            logger(stderr_text)
+            return "failed", f"退出码 {returncode}"
+
+        output_size = os.path.getsize(temp_output)
+        logger(
+            f"    - {label} 输出 {output_size / 1024 / 1024:.2f} MB，"
+            f"原始大小 {source_size / 1024 / 1024:.2f} MB"
+        )
+        if output_size <= source_size:
+            shutil.move(temp_output, output_path)
+            return "encoded", None
+        if attempt_index + 1 < len(attempts):
+            logger("    - 输出大于原文件，改用码率上限兜底重编。")
+
+    return "oversize", None
+
+
 def render_with_size_guard(
     video_path, output_path, audio_info, segments, maxrate, logger,
     output_duration=0.0, progress_prefix="",
@@ -894,7 +971,6 @@ def render_with_size_guard(
 
     try:
         temp_output = os.path.join(temp_dir, f"render_cq_{FIXED_CQ}.mp4")
-        rate_note = f"，码率上限 {maxrate / 1000:.0f} kbps" if maxrate > 0 else ""
         on_stdout = make_progress_handler(output_duration, progress_prefix)
 
         while True:
@@ -902,21 +978,18 @@ def render_with_size_guard(
                 encoder_index = _ENCODER_STATE["index"]
             encoder = ENCODER_CANDIDATES[encoder_index]
 
-            cmd = build_ffmpeg_command(
-                video_path,
-                temp_output,
-                audio_info,
-                segments,
-                FIXED_CQ,
-                maxrate,
-                encoder=encoder["name"],
+            status, detail = render_with_encoder(
+                video_path, output_path, temp_output, encoder, audio_info,
+                segments, maxrate, source_size, on_stdout, logger,
             )
-            logger(f"    - 使用 {encoder['label']} (CQ={FIXED_CQ}{rate_note}) 编码中...")
-            returncode, stderr_text = run_streaming(cmd, on_stdout=on_stdout)
-            if returncode == 0:
-                break
+            if status == "encoded":
+                return "encoded"
+            if status == "oversize":
+                shutil.copy2(video_path, output_path)
+                logger("    - 输出大于原文件，已回退为直接复制源文件到 output。")
+                return "copied_fallback"
 
-            logger(stderr_text)
+            # 编码器不可用：全局切换为下一个候选编码器。
             with _ENCODER_LOCK:
                 can_fallback = (
                     _ENCODER_STATE["index"] == encoder_index
@@ -925,23 +998,11 @@ def render_with_size_guard(
                 if can_fallback:
                     _ENCODER_STATE["index"] = encoder_index + 1
             if not can_fallback:
-                raise RuntimeError(f"ffmpeg 编码失败，退出码 {returncode}")
-
-            next_encoder = ENCODER_CANDIDATES[encoder_index + 1]
+                raise RuntimeError(f"ffmpeg 编码失败，{detail}")
             logger(
-                f"    - {encoder['label']} 编码不可用，回退到 {next_encoder['label']}。"
+                f"    - {encoder['label']} 编码不可用，"
+                f"回退到 {ENCODER_CANDIDATES[encoder_index + 1]['label']}。"
             )
-
-        output_size = os.path.getsize(temp_output)
-        logger(f"    - 输出大小 {output_size / 1024 / 1024:.2f} MB，原始大小 {source_size / 1024 / 1024:.2f} MB")
-
-        if output_size <= source_size:
-            shutil.move(temp_output, output_path)
-            return "encoded"
-        else:
-            shutil.copy2(video_path, output_path)
-            logger("    - 输出大于原文件，已回退为直接复制源文件到 output。")
-            return "copied_fallback"
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
