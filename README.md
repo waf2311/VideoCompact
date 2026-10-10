@@ -47,8 +47,7 @@ VideoCompact/
 ├─ input/              （待处理视频目录）
 ├─ output/             （输出目录）
 ├─ VideoCompact.spec   （PyInstaller 打包配置）
-├─ build.ps1           （一键打包脚本）
-├─ build.bat           （双击即可打包的入口）
+├─ build.bat           （一键打包脚本，双击运行）
 └─ .github/workflows/  （GitHub Actions 自动发布）
 ```
 
@@ -118,16 +117,17 @@ python src/gui.py
 打包后会生成一个自带运行环境的文件夹，复制到其他 Windows 电脑上双击即可运行，无需安装 Python。
 
 1. 先把 `ffmpeg.7z`、`ffprobe.7z` 解压到项目根目录
-2. 任选一种方式运行打包脚本：
+2. 双击 `build.bat` 即可（也可以在命令行传入 PyPI 镜像地址）：
 
-```powershell
-# 方式 A：双击 build.bat
-# 方式 B：右键 build.ps1 -> “使用 PowerShell 运行”
-# 方式 C：在项目根目录执行
-powershell -ExecutionPolicy Bypass -File build.ps1
+```bat
+:: 默认使用清华镜像
+build.bat
 
-# 如需使用官方 PyPI（默认使用清华镜像）：
-powershell -ExecutionPolicy Bypass -File build.ps1 -PipIndexUrl ""
+:: 使用官方 PyPI
+build.bat default
+
+:: 指定镜像地址
+build.bat https://mirrors.aliyun.com/pypi/simple/
 ```
 
 > 脚本结束会停在“按回车键退出”，不会一闪而过。
@@ -192,12 +192,12 @@ python src/gui.py
 
 ### 打包
 
-```powershell
-# 双击 build.bat，或在项目根目录执行：
-powershell -ExecutionPolicy Bypass -File build.ps1
+双击 `build.bat` 即可；也可在项目根目录用命令行调用：
 
-# 使用官方 PyPI（默认走清华镜像）
-powershell -ExecutionPolicy Bypass -File build.ps1 -PipIndexUrl ""
+```bat
+build.bat              :: 默认使用清华镜像
+build.bat default      :: 使用官方 PyPI
+build.bat <镜像地址>   :: 指定 PyPI 镜像
 ```
 
 打包依赖 `pyinstaller`、`pystray`、`pillow`，脚本会自动安装；产物见 `dist\VideoCompact\`。
@@ -303,8 +303,7 @@ STATIC_SEGMENT_MODE = "drop"
 - `src/gui.py`：图形界面入口
 - `src/core.py`：核心处理逻辑
 - `VideoCompact.spec`：PyInstaller 打包配置
-- `build.ps1`：一键打包脚本
-- `build.bat`：双击即可打包的入口（内部调用 build.ps1）
+- `build.bat`：一键打包脚本（双击运行，内部调用 PyInstaller）
 - `assets/`：应用与托盘图标
 - `docs/`：README 图片
 - `input/`：待处理视频目录

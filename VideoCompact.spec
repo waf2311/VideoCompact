@@ -6,7 +6,7 @@
 #       dist\VideoCompact\
 #         VideoCompact.exe      外部唯一的 exe
 #         bin\                  所有核心依赖（Python 运行时 + ffmpeg.exe + ffprobe.exe + 图标）
-#         input\  output\       默认输入输出目录（由 build.ps1 / 首次运行创建）
+#         input\  output\       默认输入输出目录（由 build.bat / 首次运行创建）
 #         detect\ logs\         运行后自动生成
 
 block_cipher = None
